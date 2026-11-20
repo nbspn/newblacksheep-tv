@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<!--
+=============================================================================
+ TV SLIDESHOW — index.html (GitHub Pages display page)
+=============================================================================
+ WHAT IT DOES
+   Full-screen slideshow for smart TVs and phones. Shows every image in the
+   Google Drive slideshow folder. No Google banner, and no "unable to open
+   the file" error for people signed in to several Google accounts.
+
+ HOW IT WORKS
+   - This page holds NO images and NO settings. Everything comes from the
+     Apps Script data feed (Code.gs v1.2.0+):
+       FEED_URL?api=list         → settings + list of slides
+       FEED_URL?api=image&id=ID  → one image
+   - Change slides in the Drive folder; change settings in CONFIG in Code.gs
+     (then Deploy → Manage deployments → New version). This page picks both
+     up at its next check (REFRESH_MINUTES, default 5) — no edits here.
+   - Requests are made without anyone's Google sign-in, which is what avoids
+     the multi-account error.
+   - Random order (if SHUFFLE on), never the same slide twice in a row;
+     crossfade; images cached so each downloads once; keeps playing cached
+     slides if Wi-Fi drops; full page reload every RELOAD_HOURS.
+
+ SETUP (one time)
+   1. Put this file in a public GitHub repository named e.g. blacksheep-tv,
+      as index.html.
+   2. Settings → Pages → Branch: main, /(root) → Save.
+   3. Page address: https://YOUR-USERNAME.github.io/blacksheep-tv/
+   The only thing that would ever require editing this file is FEED_URL —
+   and only if a brand-new Apps Script deployment is created (always use
+   "New version" on the existing deployment instead).
+
+=============================================================================
+ CHANGELOG
+=============================================================================
+   v1.2.0  2026-11-19  BASELINE CHECKPOINT. Standalone display page fed by
+                        the Apps Script JSON feed; replaces tv.html (iframe
+                        wrapper). Same playback behavior as Index.html
+                        v1.1.0; settings now applied live from the feed.
+=============================================================================
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Black Sheep TV</title>
+<style>
+  /* v1.2.0 */
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  .slide {
+    position: absolute; top: 0; left: 0; width: 100vw; height: 100vh;
+    object-fit: contain; opacity: 0; transition-property: opacity; transition-timing-function: ease-in-out;
+  }
+  .slide.show { opacity: 1; }
+  #msg {
+    position: absolute; top: 50%; left: 0; width: 100%; transform: translateY(-50%);
+    color: #888; font: 32px/1.4 Arial, sans-serif; text-align: center; display: none;
+  }
+</style>
+</head>
+<body>
+  <img id="a" class="slide" alt="">
+  <img id="b" class="slide" alt="">
+  <div id="msg"></div>
+
+<script>
+  // v1.2.0 — Apps Script web app /exec URL (the data feed)
+  var FEED_URL = 'https://script.google.com/macros/s/AKfycbwKIUjSeHjPoDK_yR7m3ACecssKsjPry_1sGdKAXupMw94ccalBBoIZZ7muXgpp1V5utA/exec';
+
+  // v1.2.0 — Fallback settings, used only until the feed answers
+  var CFG = { slideMs: 6000, refreshMs: 300000, reloadMs: 21600000, fadeMs: 400, shuffle: true };
+
+  var layers = [document.getElementById('a'), document.getElementById('b')];
+  var msg = document.getElementById('msg');
+  var front = 0;          // index of visible layer
+  var list = [];          // current slide list from Drive
+  var order = [];         // current play order
+  var pos = 0;            // next position in play order
+  var lastId = null;      // slide on screen (avoid back-to-back repeat)
+  var cache = {};         // id -> { updated, src }
+  var currentSrc = null;
+  var started = false;
+  var everLoaded = false;
+  var refreshTimer = null;
+
+  // v1.2.0 — GET JSON from the feed, no cookies (avoids multi-account error), 30s timeout
+  function getJSON(query) {
+    var url = FEED_URL + '?' + query + '&t=' + Date.now();
+    var req = fetch(url, { credentials: 'omit', cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (j) {
+      if (!j || !j.ok) throw new Error((j && j.error) || 'Bad response');
+      return j;
+    });
+    var timeout = new Promise(function (_, reject) {
+      setTimeout(function () { reject(new Error('timeout')); }, 30000);
+    });
+    return Promise.race([req, timeout]);
+  }
+
+  function showMsg(text) { msg.textContent = text; msg.style.display = text ? 'block' : 'none'; }
+
+  // v1.2.0 — Apply settings from the feed (live; no reload needed)
+  function applyConfig(c) {
+    if (!c) return;
+    var oldRefresh = CFG.refreshMs;
+    CFG = c;
+    layers.forEach(function (el) { el.style.transitionDuration = CFG.fadeMs + 'ms'; });
+    if (refreshTimer && CFG.refreshMs !== oldRefresh) {
+      clearInterval(refreshTimer);
+      refreshTimer = setInterval(refreshList, CFG.refreshMs);
+    }
+  }
+  applyConfig(CFG);
+
+  // v1.2.0 — Pull settings + slide list; on failure keep what we have
+  function refreshList(done) {
+    getJSON('api=list').then(function (j) {
+      everLoaded = true;
+      applyConfig(j.config);
+      var newList = j.slides || [];
+      var changed = newList.length !== list.length ||
+        newList.some(function (s, i) { return !list[i] || list[i].id !== s.id; });
+      list = newList;
+      if (changed) { order = []; pos = 0; }
+      var keep = {};
+      list.forEach(function (s) { keep[s.id] = true; });
+      Object.keys(cache).forEach(function (id) { if (!keep[id]) delete cache[id]; });
+      if (done) done();
+    }).catch(function () {
+      if (!everLoaded) showMsg('Connecting to slideshow…');
+      if (done) done();
+    });
+  }
+
+  // v1.2.0 — Play order: shuffled (Fisher-Yates) or filename order
+  function buildOrder() {
+    var o = list.slice();
+    if (CFG.shuffle) {
+      for (var i = o.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        var t = o[i]; o[i] = o[j]; o[j] = t;
+      }
+      if (o.length > 1 && o[0].id === lastId) { var t2 = o[0]; o[0] = o[1]; o[1] = t2; }
+    }
+    return o;
+  }
+
+  // v1.2.0 — Image from cache, or download (re-download if file changed)
+  function loadImage(item, cb) {
+    var c = cache[item.id];
+    if (c && c.updated === item.updated) { cb(c.src); return; }
+    getJSON('api=image&id=' + encodeURIComponent(item.id)).then(function (j) {
+      cache[item.id] = { updated: item.updated, src: j.data };
+      cb(j.data);
+    }).catch(function () { cb(c ? c.src : null); });
+  }
+
+  // v1.2.0 — Show next slide with crossfade, then schedule the one after
+  function showNext() {
+    if (!list.length) {
+      if (everLoaded) showMsg('No slides yet — add images to the slideshow folder in Google Drive.');
+      layers.forEach(function (el) { el.classList.remove('show'); });
+      currentSrc = null;
+      setTimeout(showNext, 10000);
+      return;
+    }
+    showMsg('');
+    if (pos >= order.length) { order = buildOrder(); pos = 0; }
+    var item = order[pos];
+    pos++;
+
+    loadImage(item, function (src) {
+      if (!src) { setTimeout(showNext, 1000); return; }
+      if (src === currentSrc) { setTimeout(showNext, CFG.slideMs); return; }
+      var back = 1 - front;
+      var el = layers[back];
+      el.onload = function () {
+        el.onload = null;
+        el.classList.add('show');
+        layers[front].classList.remove('show');
+        front = back;
+        currentSrc = src;
+        lastId = item.id;
+        prefetch();
+        setTimeout(showNext, CFG.slideMs);
+      };
+      el.onerror = function () { el.onerror = null; setTimeout(showNext, 1000); };
+      el.src = src;
+    });
+  }
+
+  // v1.2.0 — Warm the cache for the upcoming slide
+  function prefetch() {
+    if (pos >= order.length) return;
+    loadImage(order[pos], function () {});
+  }
+
+  // v1.2.0 — Click / OK button attempts full-screen (support varies by TV)
+  document.addEventListener('click', function () {
+    var d = document.documentElement;
+    var fs = d.requestFullscreen || d.webkitRequestFullscreen;
+    if (fs) { try { fs.call(d); } catch (e) {} }
+  });
+
+  // v1.2.0 — Start; retry every 30s until the feed answers the first time
+  function start() {
+    refreshList(function () {
+      if (!everLoaded) { setTimeout(start, 30000); return; }
+      if (!started) {
+        started = true;
+        refreshTimer = setInterval(refreshList, CFG.refreshMs);
+        setTimeout(function () {
+          if (navigator.onLine !== false) window.location.reload();
+        }, CFG.reloadMs);
+        showNext();
+      }
+    });
+  }
+  start();
+</script>
+</body>
+</html>
