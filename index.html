@@ -61,6 +61,12 @@
                         piece; pieces enter from the right in order, loop
                         back to the first message, and are removed after
                         they leave the left edge. Same look and speed.
+   v1.4.5  2026-11-21  Bar glitch at every slide change fixed. (1) Bar pieces
+                        now move with the browser's animation engine (Web
+                        Animations, runs off the main thread) so loading a
+                        slide no longer pauses the bar; older browsers fall
+                        back to the v1.4.4 frame loop. (2) Each slide image is
+                        fully decoded (img.decode) before the crossfade starts.
 =============================================================================
 -->
 <html>
@@ -167,6 +173,7 @@
     var key = messages.join('\n');
     if (key === tickerKey) return;
     tickerKey = key;
+    tickerLive.forEach(function (p) { if (p.anim) p.anim.cancel(); });  // v1.4.5
     tickerEl.innerHTML = ''; tickerLive = []; tickerSegs = []; tickerNext = 0;   // v1.4.4
     if (!messages.length) { document.body.classList.remove('has-ticker'); return; }
     document.body.classList.add('has-ticker');
@@ -175,7 +182,11 @@
       return (i === 0 ? '<img class="logo" src="' + TICKER_LOGO + '" alt="">' : '') + escapeHtml(m) + sep;  // v1.4.2 logo before the first message
     });
   }
-  function tickerAdd(x) {                                               // v1.4.4 — add the next piece at x
+  var tickerV = 0;          // v1.4.5 — speed (px/s) the live pieces were started with
+  var USE_WAAPI = typeof document.body.animate === 'function' && document.timeline;  // v1.4.5
+  function tickerNow() { return USE_WAAPI ? document.timeline.currentTime : performance.now(); }  // v1.4.5
+  function tickerPos(p, now) { return p.x0 - tickerV * (now - p.t0) / 1000; }  // v1.4.5 — where a piece is now
+  function tickerAdd(x, now) {                                          // v1.4.4 — add the next piece at x
     var el = document.createElement('span');
     el.className = 'piece';
     el.innerHTML = tickerSegs[tickerNext];
@@ -183,26 +194,37 @@
     tickerEl.appendChild(el);
     var w = el.getBoundingClientRect().width || 1;
     el.style.transform = 'translateX(' + x + 'px)';
-    tickerLive.push({ el: el, x: x, w: w });
+    var p = { el: el, x0: x, t0: now, w: w, anim: null };              // v1.4.5
+    if (USE_WAAPI) {                                                    // v1.4.5 — compositor-driven movement
+      var dist = x + w + 10;
+      p.anim = el.animate([{ transform: 'translateX(' + x + 'px)' }, { transform: 'translateX(' + (x - dist) + 'px)' }],
+        { duration: dist / tickerV * 1000, easing: 'linear', fill: 'forwards' });
+      p.anim.startTime = now;
+    }
+    tickerLive.push(p);
   }
   function tickerFrame(ts) {
     if (tickerKey && tickerSegs.length) {                               // v1.4.4
-      var dt = tickerLast ? Math.min(ts - tickerLast, 100) : 0;
-      var speed = (CFG.tickerSpeed || 120) * (window.innerWidth / 1920);  // px per second, scaled to screen
-      var dx = speed * dt / 1000;
-      if (!tickerLive.length) tickerAdd(window.innerWidth);            // start just off the right edge
-      for (var i = 0; i < tickerLive.length; i++) {
-        var p = tickerLive[i];
-        p.x -= dx;
-        p.el.style.transform = 'translateX(' + p.x + 'px)';
+      var now = tickerNow();                                            // v1.4.5
+      var v = (CFG.tickerSpeed || 120) * (window.innerWidth / 1920);    // px per second, scaled to screen
+      if (v !== tickerV) {                                              // v1.4.5 — speed changed: restart the run
+        tickerLive.forEach(function (p) { if (p.anim) p.anim.cancel(); tickerEl.removeChild(p.el); });
+        tickerLive = []; tickerNext = 0; tickerV = v;
       }
-      while (tickerLive.length && tickerLive[0].x + tickerLive[0].w < 0) {  // drop pieces that left the screen
+      if (!tickerLive.length) tickerAdd(window.innerWidth, now);        // start just off the right edge
+      if (!USE_WAAPI) {                                                 // v1.4.5 — fallback: move pieces each frame
+        for (var i = 0; i < tickerLive.length; i++) {
+          tickerLive[i].el.style.transform = 'translateX(' + tickerPos(tickerLive[i], now) + 'px)';
+        }
+      }
+      while (tickerLive.length && tickerPos(tickerLive[0], now) + tickerLive[0].w < 0) {  // drop pieces that left the screen
+        if (tickerLive[0].anim) tickerLive[0].anim.cancel();
         tickerEl.removeChild(tickerLive[0].el);
         tickerLive.shift();
       }
       var tail = tickerLive[tickerLive.length - 1];
-      while (tail && tail.x + tail.w < window.innerWidth + 50) {        // keep the screen filled, looping messages
-        tickerAdd(tail.x + tail.w);
+      while (tail && tickerPos(tail, now) + tail.w < window.innerWidth + 400) {  // keep the screen filled (v1.4.5 — larger look-ahead)
+        tickerAdd(tickerPos(tail, now) + tail.w, now);
         tail = tickerLive[tickerLive.length - 1];
       }
     }
@@ -295,6 +317,7 @@
       var el = layers[back];
       el.onload = function () {
         el.onload = null;
+        var swap = function () {                                       // v1.4.5 — show only after full decode
         el.classList.add('show');
         layers[front].classList.remove('show');
         front = back;
@@ -302,6 +325,8 @@
         lastId = item.id;
         prefetch();
         setTimeout(showNext, slideTime(item));  // v1.4.3 — was CFG.slideMs
+        };
+        if (el.decode) el.decode().then(swap, swap); else swap();      // v1.4.5
       };
       el.onerror = function () { el.onerror = null; setTimeout(showNext, 1000); };
       el.src = src;
