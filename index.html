@@ -31,6 +31,9 @@
    "TV Scrolling Message" Google Doc), a navy bar scrolls them across the
    bottom and the slides shrink to fit above it. No messages = no bar.
 
+   TV CODE (v1.5.1): each screen enters the 10-digit code once (remote or
+   keyboard); the browser remembers it. No code in this file or the link.
+
    The only thing that would ever require editing this file is FEED_URL —
    and only if a brand-new Apps Script deployment is created (always use
    "New version" on the existing deployment instead).
@@ -67,6 +70,11 @@
                         slide no longer pauses the bar; older browsers fall
                         back to the v1.4.4 frame loop. (2) Each slide image is
                         fully decoded (img.decode) before the crossfade starts.
+   v1.5.1  2026-11-22  10-digit TV code: first visit shows a code box; the
+                        code is saved in the browser and sent with every
+                        feed request. Wrong code = "Wrong code". If the code
+                        is changed in Apps Script, screens return to the code
+                        box. Must match Code.gs v1.5.1+ (SHA-512 since v1.5.2).
 =============================================================================
 -->
 <html>
@@ -102,6 +110,14 @@
   #tickerText .sep { color: #FF6600; padding: 0 1.2em; }
   /* v1.4.2 — logo at the start of each run, fits inside the bar */
   #tickerText .logo { height: 8vh; width: calc(8vh * 165 / 172);  /* fixed size so the scroll loop measures correctly before the image decodes */ vertical-align: middle; margin: 0 0.9em 0 0; position: relative; top: -0.3vh; }
+  /* v1.5.1 — code box */
+  #codeBox { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; background: #000; cursor: auto; z-index: 10; font-family: Arial, sans-serif; color: #fff; }
+  #codeBox .codeTitle { font: bold 6vh Arial, sans-serif; color: #FF6600; margin-bottom: 4vh; }
+  #codeBox .codeLabel { font-size: 4vh; margin-bottom: 2vh; }
+  #codeInput { font: bold 7vh monospace; width: 11em; text-align: center; letter-spacing: 0.15em; padding: 1vh; border: 4px solid #1F4E78; border-radius: 1vh; }
+  #codeBtn { margin-top: 3vh; font: bold 4.5vh Arial, sans-serif; padding: 1.5vh 6vh; background: #1F4E78; color: #fff; border: 0; border-radius: 1vh; }
+  #codeBtn:focus, #codeInput:focus { outline: 6px solid #FF6600; }
+  #codeErr { margin-top: 3vh; font-size: 4vh; color: #FF6600; min-height: 5vh; }
   #msg {
     position: absolute; top: 50%; left: 0; width: 100%; transform: translateY(-50%);
     color: #888; font: 32px/1.4 Arial, sans-serif; text-align: center; display: none;
@@ -112,6 +128,14 @@
   <img id="a" class="slide" alt="">
   <img id="b" class="slide" alt="">
   <div id="msg"></div>
+  <!-- v1.5.1 — TV code box -->
+  <div id="codeBox">
+    <div class="codeTitle">N.E.W. Black Sheep TV</div>
+    <div class="codeLabel">Enter 10-digit code</div>
+    <input id="codeInput" type="tel" inputmode="numeric" maxlength="10" autocomplete="off">
+    <button id="codeBtn" type="button">OK</button>
+    <div id="codeErr"></div>
+  </div>
   <div id="ticker"><div id="tickerText"></div></div>  <!-- v1.4.0 -->
 
 <script>
@@ -132,15 +156,21 @@
   var currentSrc = null;
   var started = false;
   var everLoaded = false;
+  // v1.5.1 — TV code, remembered in this browser
+  var CODE_KEY = 'bsTvCode';
+  var CODE = '';
+  try { CODE = window.localStorage.getItem(CODE_KEY) || ''; } catch (e) { CODE = ''; }
+  var badCode = false;
   var refreshTimer = null;
 
   // v1.2.0 — GET JSON from the feed, no cookies (avoids multi-account error), 30s timeout
   function getJSON(query) {
-    var url = FEED_URL + '?' + query + '&t=' + Date.now();
+    var url = FEED_URL + '?' + query + '&code=' + encodeURIComponent(CODE) + '&t=' + Date.now();  // v1.5.1 — code added
     var req = fetch(url, { credentials: 'omit', cache: 'no-store' }).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     }).then(function (j) {
+      if (j && j.error === 'unauthorized') badCode = true;             // v1.5.1
       if (!j || !j.ok) throw new Error((j && j.error) || 'Bad response');
       return j;
     });
@@ -262,6 +292,7 @@
       Object.keys(cache).forEach(function (id) { if (!keep[id]) delete cache[id]; });
       if (done) done();
     }).catch(function () {
+      if (badCode) { forgetCodeAndAsk(); return; }                      // v1.5.1 — code wrong or changed
       if (!everLoaded) showMsg('Connecting to slideshow…');
       if (done) done();
     });
@@ -346,8 +377,46 @@
     if (fs) { try { fs.call(d); } catch (e) {} }
   });
 
+  // v1.5.1 — code box
+  var codeBox = document.getElementById('codeBox');
+  var codeInput = document.getElementById('codeInput');
+  var codeErr = document.getElementById('codeErr');
+  function showCodeBox(errText) {
+    showMsg('');
+    codeErr.textContent = errText || '';
+    codeInput.value = '';
+    codeBox.style.display = 'flex';
+    setTimeout(function () { codeInput.focus(); }, 100);
+  }
+  function forgetCodeAndAsk() {
+    try { window.localStorage.removeItem(CODE_KEY); } catch (e) {}
+    if (started) { window.location.reload(); return; }   // stop the running slideshow cleanly
+    CODE = ''; badCode = false;
+    showCodeBox('Code changed or incorrect. Please enter the current code.');
+  }
+  function submitCode() {
+    var v = (codeInput.value || '').replace(/\D/g, '');
+    if (v.length !== 10) { codeErr.textContent = 'The code is 10 digits.'; return; }  // v1.5.1 — was 8
+    codeErr.textContent = 'Checking…';
+    CODE = v; badCode = false;
+    getJSON('api=list').then(function () {
+      try { window.localStorage.setItem(CODE_KEY, CODE); } catch (e) {}
+      codeBox.style.display = 'none';
+      start();
+    }).catch(function () {
+      CODE = '';
+      codeErr.textContent = badCode ? 'Wrong code' : 'Cannot reach the slideshow. Check Wi-Fi and try again.';
+      badCode = false;
+      codeInput.value = '';
+      codeInput.focus();
+    });
+  }
+  document.getElementById('codeBtn').addEventListener('click', submitCode);
+  codeInput.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.keyCode === 13) submitCode(); });
+
   // v1.2.0 — Start; retry every 30s until the feed answers the first time
   function start() {
+    if (!CODE) { showCodeBox(''); return; }                         // v1.5.1
     refreshList(function () {
       if (!everLoaded) { setTimeout(start, 30000); return; }
       if (!started) {
