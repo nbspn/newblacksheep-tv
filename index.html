@@ -75,6 +75,14 @@
                         feed request. Wrong code = "Wrong code". If the code
                         is changed in Apps Script, screens return to the code
                         box. Must match Code.gs v1.5.1+ (SHA-512 since v1.5.2).
+   v1.5.2  2026-11-22  Scroll bar glitch at slide changes (on TVs). (1) The
+                        bar and its pieces get their own graphics layer, so
+                        the slide fade no longer makes the bar redraw. (2)
+                        Slides are handed to the browser as image files (blob
+                        URLs) instead of very long base64 text, which cuts
+                        memory and decode work on the TV. (3) The next slide
+                        is downloaded after the fade finishes, not during it.
+                        No change to look, timing, or how slides are managed.
 =============================================================================
 -->
 <html>
@@ -101,12 +109,15 @@
     background: #1F4E78; overflow: hidden; display: none;
   }
   body.has-ticker #ticker { display: block; }
+  /* v1.5.2 — own graphics layers: slide fade no longer repaints the bar */
+  #ticker { will-change: transform; transform: translateZ(0); contain: layout paint; z-index: 2; }
+  .slide { will-change: opacity; }
   #tickerText {
     position: absolute; top: 0; left: 0; height: 10vh; line-height: 10vh;
     white-space: nowrap; color: #fff; font: bold 5.5vh/10vh Arial, sans-serif;
   }
   /* v1.4.4 — each message is its own piece (no giant strip) */
-  #tickerText .piece { position: absolute; top: 0; left: 0; white-space: nowrap; }
+  #tickerText .piece { position: absolute; top: 0; left: 0; white-space: nowrap; will-change: transform; }  /* v1.5.2 will-change */
   #tickerText .sep { color: #FF6600; padding: 0 1.2em; }
   /* v1.4.2 — logo at the start of each run, fits inside the bar */
   #tickerText .logo { height: 8vh; width: calc(8vh * 165 / 172);  /* fixed size so the scroll loop measures correctly before the image decodes */ vertical-align: middle; margin: 0 0.9em 0 0; position: relative; top: -0.3vh; }
@@ -289,7 +300,7 @@
       if (changed) { order = []; pos = 0; }
       var keep = {};
       list.forEach(function (s) { keep[s.id] = true; });
-      Object.keys(cache).forEach(function (id) { if (!keep[id]) delete cache[id]; });
+      Object.keys(cache).forEach(function (id) { if (!keep[id]) { freeSrc(cache[id].src); delete cache[id]; } });  // v1.5.2 — free removed slides
       if (done) done();
     }).catch(function () {
       if (badCode) { forgetCodeAndAsk(); return; }                      // v1.5.1 — code wrong or changed
@@ -311,13 +322,32 @@
     return o;
   }
 
+  // v1.5.2 — turn the feed's "data:image/...;base64,..." text into a blob URL
+  //          (falls back to the data URL if the browser can't)
+  function toBlobUrl(dataUrl) {
+    try {
+      if (!window.URL || !URL.createObjectURL || !window.Blob) return dataUrl;
+      var comma = dataUrl.indexOf(',');
+      var mime = (dataUrl.slice(5, comma).split(';')[0]) || 'image/jpeg';
+      var bin = atob(dataUrl.slice(comma + 1));
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return URL.createObjectURL(new Blob([bytes], { type: mime }));
+    } catch (e) { return dataUrl; }
+  }
+  function freeSrc(src) {                                               // v1.5.2
+    if (src && src.indexOf('blob:') === 0 && src !== currentSrc) { try { URL.revokeObjectURL(src); } catch (e) {} }
+  }
+
   // v1.2.0 — Image from cache, or download (re-download if file changed)
   function loadImage(item, cb) {
     var c = cache[item.id];
     if (c && c.updated === item.updated) { cb(c.src); return; }
     getJSON('api=image&id=' + encodeURIComponent(item.id)).then(function (j) {
-      cache[item.id] = { updated: item.updated, src: j.data };
-      cb(j.data);
+      var src = toBlobUrl(j.data);                                      // v1.5.2 — blob URL instead of base64 text
+      if (c && c.src !== src) freeSrc(c.src);                           // v1.5.2 — release the old copy
+      cache[item.id] = { updated: item.updated, src: src };
+      cb(src);
     }).catch(function () { cb(c ? c.src : null); });
   }
 
@@ -354,7 +384,7 @@
         front = back;
         currentSrc = src;
         lastId = item.id;
-        prefetch();
+        setTimeout(prefetch, (CFG.fadeMs || 0) + 1500);                // v1.5.2 — download next slide after the fade, not during it
         setTimeout(showNext, slideTime(item));  // v1.4.3 — was CFG.slideMs
         };
         if (el.decode) el.decode().then(swap, swap); else swap();      // v1.4.5
